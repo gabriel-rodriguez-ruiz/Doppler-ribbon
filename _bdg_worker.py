@@ -8,59 +8,93 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import numpy as np
 import scipy.sparse as sp
 
-hbar2_over_2m = 948.0
-hbar = 0.6582119
-m_eff = (hbar**2) / (2.0 * hbar2_over_2m)
+# --- PARÁMETROS FÍSICOS IDÉNTICOS A TU MODELO ---
+c = 3e17                      # nm/s
+m_e = 5.1e8 / c**2            # meV s^2 / nm^2
+m = 0.0403 * m_e              # meV s^2 / nm^2
+hbar = 6.58e-13               # meV s
+gamma = hbar**2 / (2.0 * m)   # meV nm^2  (~1661.2 meV nm^2)
+E_F = 50.6                    # meV
+k_F = np.sqrt(E_F / gamma)    # 1/nm      (~0.1745 nm^-1)
 
-Lx = 200.0
-Ly = 2000.0
-Nx = 100
-a = Lx / (Nx + 1)
+Delta = 0.08                  # meV
+mu = E_F                      # meV
+Lambda = 15.0 * 4.0 / 3.0     # meV nm    (20.0 meV nm)
 
-mu = 50.6
-Delta0 = 0.08
-alpha_R = 25.0
-Ez = 0.05
+theta = np.pi / 2.0
+cut_off = 2.0 * k_F
+phi_y = 0.0
+h = 5e-5                      # Paso del stencil en 1/nm
 
-v_fraunhofer = (np.pi * hbar) / (m_eff * Lx)
-area = Lx * Ly
+# --- PARÁMETROS DE TEMPERATURA Y ZEEMAN ---
+T = False
+beta = 64.0
+Zeeman = True
+Z_RATIO = 1.0                 # E_Z = Z_RATIO * B
 
-t = hbar2_over_2m / (a**2)
-t_R = alpha_R / (2.0 * a)
-V_x = np.zeros(Nx)
+# --- GEOMETRÍA OBC EN x ---
+L_x = 2500.0 / 2.0            # 1250.0 nm
+B_star = 4.0 * Delta          # Campo de 1/4 de cuanto de flujo: q_D_x(B*) = pi / (2 * L_x)
+q_B_constant = (np.pi / (2.0 * L_x)) / B_star
 
-kF = np.sqrt(mu / hbar2_over_2m)
-ky_cutoff = 1.35 * kF
-ny_max = int(np.floor(ky_cutoff * Ly / (2.0 * np.pi)))
+# Discretización en x: con L_x = 1250 nm y k_F ~ 0.1745 nm^-1 hay ~69 sub-bandas ocupadas.
+# Nx = 280 da un paso a ~ 4.45 nm (Nx > 4 * N_sub), manteniendo buen balance velocidad/precisión.
+Nx = 160 #280
+a = L_x / (Nx + 1)
+t_hop = gamma / (a**2)
+t_R = Lambda / (2.0 * a)
 
-ny_full = np.arange(-ny_max, ny_max + 1)
-ky_full = 2.0 * np.pi * ny_full / Ly
+# --- GRILLA ADAPTATIVA EN ky (Concentrada alrededor de las superficies de Fermi) ---
+k_so = Lambda / (2.0 * gamma)
+k_F_eff = np.sqrt(k_F**2 + k_so**2)
+k_F_in = max(0.0, k_F_eff - k_so)
+k_F_out = k_F_eff + k_so
+k_limit = k_F_out + 0.1 * k_F
 
-ny_half = np.arange(0, ny_max + 1)
-ky_half = 2.0 * np.pi * ny_half / Ly
-weights_half = np.where(ny_half == 0, 1.0, 2.0)
+# Regla del trapecio / punto medio adaptativo en ky
+N_ky_inner = 180 #320
+N_ky_outer = 60
+k_y_half = np.unique(np.concatenate([
+    np.linspace(0.0, k_limit, N_ky_inner),
+    np.linspace(k_limit, cut_off, N_ky_outer)
+]))
+k_y_values = np.unique(np.concatenate([-k_y_half[::-1], k_y_half]))
 
-s0 = sp.eye(2, format='csr', dtype=complex)
-sx = sp.csr_matrix([[0, 1], [1, 0]], dtype=complex)
-sy = sp.csr_matrix([[0, -1j], [1j, 0]], dtype=complex)
-sz = sp.csr_matrix([[1, 0], [0, -1]], dtype=complex)
+dk_y = np.diff(k_y_values)
+W_KY = np.empty_like(k_y_values)
+W_KY[0] = 0.5 * dk_y[0]
+W_KY[-1] = 0.5 * dk_y[-1]
+W_KY[1:-1] = 0.5 * (dk_y[:-1] + dk_y[1:])
 
-P_e = sp.csr_matrix([[1, 0], [0, 0]], dtype=complex)
-P_h = sp.csr_matrix([[0, 0], [0, 1]], dtype=complex)
+s0 = sp.csr_matrix(np.array([[1, 0], [0, 1]], dtype=complex))
+sx = sp.csr_matrix(np.array([[0, 1], [1, 0]], dtype=complex))
+sy = sp.csr_matrix(np.array([[0, -1j], [1j, 0]], dtype=complex))
+sz = sp.csr_matrix(np.array([[1, 0], [0, -1]], dtype=complex))
+P_e = sp.csr_matrix(np.array([[1, 0], [0, 0]], dtype=complex))
+P_h = sp.csr_matrix(np.array([[0, 0], [0, 1]], dtype=complex))
 I_Nx = sp.eye(Nx, format='csr', dtype=complex)
 
-def compute_Egs_2D_shift(vx, vy, delta_val, use_half_grid=False):
-    theta_x = (m_eff * vx * a) / hbar
+def eval_thermodynamic_potential(eigvals, T_flag, beta_val):
+    if T_flag:
+        stable_term = np.minimum(0.0, eigvals)
+        log_term = -(1.0 / beta_val) * np.log1p(np.exp(-beta_val * np.abs(eigvals)))
+        return stable_term + log_term
+    else:
+        return np.minimum(0.0, eigvals)
+
+def compute_E_single_point(px, py, bx, by, delta_val):
+    '''Calcula E(px, py) en OBC en x para un punto dado del stencil.'''
+    theta_x = px * a
     phase_plus = np.exp(1j * theta_x)
     phase_minus = np.exp(-1j * theta_x)
-    ky_shift = (m_eff * vy) / hbar
 
+    # Saltos cinéticos en x con fase px
     H_kin_off_e = sp.diags(
-        [-t * phase_plus * np.ones(Nx - 1), -t * phase_minus * np.ones(Nx - 1)],
+        [-t_hop * phase_plus * np.ones(Nx - 1), -t_hop * phase_minus * np.ones(Nx - 1)],
         offsets=[1, -1], shape=(Nx, Nx), format='csr', dtype=complex
     )
     H_kin_off_h = sp.diags(
-        [+t * phase_minus * np.ones(Nx - 1), +t * phase_plus * np.ones(Nx - 1)],
+        [+t_hop * phase_minus * np.ones(Nx - 1), +t_hop * phase_plus * np.ones(Nx - 1)],
         offsets=[1, -1], shape=(Nx, Nx), format='csr', dtype=complex
     )
     H_kin_off = (
@@ -68,6 +102,7 @@ def compute_Egs_2D_shift(vx, vy, delta_val, use_half_grid=False):
         sp.kron(sp.kron(P_h, s0), H_kin_off_h, format='csr')
     )
 
+    # Rashba en x: +Lambda * (kx + px) * sigma_y para e, +Lambda * (-kx + px) * sigma_y para h
     D_rashba_e = sp.diags(
         [-1j * t_R * phase_plus * np.ones(Nx - 1), +1j * t_R * phase_minus * np.ones(Nx - 1)],
         offsets=[1, -1], shape=(Nx, Nx), format='csr', dtype=complex
@@ -81,52 +116,73 @@ def compute_Egs_2D_shift(vx, vy, delta_val, use_half_grid=False):
         sp.kron(sp.kron(P_h, sy), D_rashba_h, format='csr')
     )
 
-    Delta_mat = sp.diags(np.full(Nx, delta_val), offsets=0, shape=(Nx, Nx), format='csr', dtype=complex)
+    # Convención de signos idéntica a tu tensor: -by * KRON_Y - bx * KRON_X - Delta * KRON_X_0
+    H_zeeman = (
+        sp.kron(sp.kron(s0, sx), (-bx) * I_Nx, format='csr') +
+        sp.kron(sp.kron(s0, sy), (-by) * I_Nx, format='csr')
+    )
+    Delta_mat = sp.diags(np.full(Nx, -delta_val), offsets=0, shape=(Nx, Nx), format='csr', dtype=complex)
+
     H_base = (
-        H_kin_off + H_rashba_x +
-        sp.kron(sp.kron(sz, sy), Ez * I_Nx, format='csr') +
+        H_kin_off + H_rashba_x + H_zeeman +
         sp.kron(sp.kron(sx, s0), Delta_mat, format='csr')
     ).toarray()
 
-    E_gs_total = 0.0
     idx_e_up = np.arange(0, Nx)
     idx_e_dn = np.arange(Nx, 2 * Nx)
     idx_h_dn = np.arange(2 * Nx, 3 * Nx)
     idx_h_up = np.arange(3 * Nx, 4 * Nx)
 
     H_BdG = np.empty_like(H_base)
-    k_iter = zip(ky_half, weights_half) if use_half_grid else zip(ky_full, np.ones_like(ky_full))
+    ky_integrand = np.empty(len(k_y_values), dtype=np.float64)
 
-    for ky, w in k_iter:
+    for j, ky in enumerate(k_y_values):
         np.copyto(H_BdG, H_base)
-        ky_e = ky - ky_shift
-        ky_h = ky + ky_shift
+        ky_p = ky + py
+        ky_m = -ky + py
 
-        diag_e = 2.0 * t + hbar2_over_2m * (ky_e**2) + V_x - mu
-        diag_h = -(2.0 * t + hbar2_over_2m * (ky_h**2) + V_x - mu)
+        diag_e = 2.0 * t_hop + gamma * (ky_p**2) - mu
+        diag_h = -(2.0 * t_hop + gamma * (ky_m**2) - mu)
 
         H_BdG[idx_e_up, idx_e_up] += diag_e
         H_BdG[idx_e_dn, idx_e_dn] += diag_e
         H_BdG[idx_h_dn, idx_h_dn] += diag_h
         H_BdG[idx_h_up, idx_h_up] += diag_h
 
-        ry_e = -alpha_R * ky_e
-        ry_h = +alpha_R * ky_h
+        # Rashba en y: -Lambda * (ky + py) * sigma_x para e, -Lambda * (-ky + py) * sigma_x para h
+        ry_e = -Lambda * ky_p
+        ry_h = -Lambda * ky_m
         H_BdG[idx_e_up, idx_e_dn] += ry_e
         H_BdG[idx_e_dn, idx_e_up] += ry_e
         H_BdG[idx_h_dn, idx_h_up] += ry_h
         H_BdG[idx_h_up, idx_h_dn] += ry_h
 
         evals = np.linalg.eigvalsh(H_BdG)
-        tr_He = 2.0 * np.sum(diag_e)
-        neg_sum = np.sum(evals[evals < 0.0])
-        E_gs_total += w * 0.5 * (neg_sum + tr_He)
+        ky_integrand[j] = np.sum(eval_thermodynamic_potential(evals, T, beta))
 
-    return E_gs_total
+    # Normalización idéntica a tu código: divide por L_x para obtener densidad por área
+    return 0.5 * (ky_integrand @ W_KY) / L_x
 
-def worker_flux_point(idx, vx, dvy, factor_q):
-    E_center = compute_Egs_2D_shift(vx, 0.0, Delta0, use_half_grid=True)
-    E_plus   = compute_Egs_2D_shift(vx, +dvy, Delta0, use_half_grid=False)
-    E_minus  = compute_Egs_2D_shift(vx, -dvy, Delta0, use_half_grid=False)
-    Ds_yy_sc = (factor_q / area) * ((E_plus - 2.0 * E_center + E_minus) / (dvy**2))
-    return idx, E_center, Ds_yy_sc
+def worker_B_point(idx, B_val):
+    bx = B_val * np.cos(theta) * Zeeman * Z_RATIO
+    by = B_val * np.sin(theta) * Zeeman * Z_RATIO
+    q_D_x = q_B_constant * B_val * np.sin(theta)
+    q_D_y = q_B_constant * B_val * (-np.cos(theta)) + phi_y
+
+    # Stencil de 9 puntos idéntico al tuyo
+    offsets_x = np.array([0.0, -h, h, 0.0, 0.0, h, -h, h, -h])
+    offsets_y = np.array([0.0, 0.0, 0.0, -h, h, h, -h, -h, h])
+
+    E_stencil = np.empty(9, dtype=np.float64)
+    for s in range(9):
+        px = q_D_x + offsets_x[s]
+        py = q_D_y + offsets_y[s]
+        E_sc = compute_E_single_point(px, py, bx, by, Delta)
+        E_norm = compute_E_single_point(px, py, bx, by, 0.0)
+        E_stencil[s] = E_sc - E_norm
+
+    n_xx = (E_stencil[2] - 2.0 * E_stencil[0] + E_stencil[1]) / (h**2)
+    n_yy = (E_stencil[4] - 2.0 * E_stencil[0] + E_stencil[3]) / (h**2)
+    n_xy = (E_stencil[5] - E_stencil[7] - E_stencil[8] + E_stencil[6]) / (4.0 * h**2)
+
+    return idx, n_xx, n_yy, n_xy, E_stencil[0]
